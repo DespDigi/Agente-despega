@@ -47,6 +47,31 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 load_dotenv()
 
+# ── Reparación de variables de entorno (Railway / carga desde el teléfono) ──
+# Al crear variables desde el teclado del teléfono es fácil que el NOMBRE de
+# una variable quede con un espacio invisible al final (ej. "WHATSAPP_PROVIDER "
+# en vez de "WHATSAPP_PROVIDER"). El sistema operativo la guarda así y luego
+# os.getenv("WHATSAPP_PROVIDER") no la encuentra, aunque el panel la muestre
+# bien. Aquí normalizamos: cualquier nombre con espacios sobrantes se copia a
+# su nombre limpio, para TODAS las variables de una vez.
+for _clave in list(os.environ.keys()):
+    _limpia = _clave.strip()
+    if _limpia and _limpia != _clave:
+        if not os.environ.get(_limpia, "").strip():
+            os.environ[_limpia] = os.environ[_clave]
+        del os.environ[_clave]
+
+# Valores por defecto NO secretos: si una de estas variables falta o quedó
+# vacía, el agente usa el valor correcto de la configuración de Despega
+# Digital. Las claves secretas (API keys) NUNCA llevan valor por defecto.
+for _var, _defecto in (
+    ("WHATSAPP_PROVIDER", "zernio"),
+    ("AI_PROVIDER", "gemini"),
+    ("GEMINI_MODEL", "gemini-2.5-flash"),
+):
+    if not os.environ.get(_var, "").strip():
+        os.environ[_var] = _defecto
+
 logger = logging.getLogger("agentkit")
 
 
