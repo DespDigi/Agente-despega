@@ -67,7 +67,7 @@ for _clave in list(os.environ.keys()):
 for _var, _defecto in (
     ("WHATSAPP_PROVIDER", "zernio"),
     ("AI_PROVIDER", "gemini"),
-    ("GEMINI_MODEL", "gemini-2.5-flash"),
+    ("GEMINI_MODEL", "gemini-2.5-flash-lite"),
 ):
     if not os.environ.get(_var, "").strip():
         os.environ[_var] = _defecto
@@ -693,12 +693,19 @@ MAX_TOKENS = int(os.getenv("ANTHROPIC_MAX_TOKENS") or "4096")
 _soporta_esfuerzo = True
 
 # ── Google Gemini ──────────────────────────────────────────
-# Nivel gratis de AI Studio. Gemini expone un endpoint compatible con OpenAI:
-# las peticiones son POST a <base>/chat/completions con la clave como Bearer.
+# Nivel gratis de AI Studio. Se usa la API NATIVA de Gemini
+# (POST <base>/models/<modelo>:generateContent, clave en el header
+# x-goog-api-key), NO el endpoint compatible con OpenAI: desde mayo de 2026
+# AI Studio emite claves de autorizacion nuevas que empiezan con "AQ." y el
+# endpoint compatible con OpenAI las rechaza con HTTP 400 "Invalid Auth key"
+# aunque la clave sea valida. La ruta nativa con x-goog-api-key acepta tanto
+# las claves nuevas "AQ." como las clasicas "AIza".
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or ""
-MODELO_GEMINI = os.getenv("GEMINI_MODEL") or "gemini-2.5-flash"
+# Ojo: gemini-2.5-flash ya no esta disponible para proyectos NUEVOS de AI
+# Studio; el modelo seguro para proyectos recien creados es el -lite.
+MODELO_GEMINI = os.getenv("GEMINI_MODEL") or "gemini-2.5-flash-lite"
 GEMINI_BASE_URL = (
-    os.getenv("GEMINI_BASE_URL") or "https://generativelanguage.googleapis.com/v1beta/openai/"
+    os.getenv("GEMINI_BASE_URL") or "https://generativelanguage.googleapis.com/v1beta"
 ).rstrip("/")
 GEMINI_MAX_TOKENS = int(os.getenv("GEMINI_MAX_TOKENS") or "4096")
 # Generar una respuesta puede tardar bastante mas que el timeout de 5s que trae
@@ -839,24 +846,42 @@ async def _generar_con_anthropic(mensaje: str, historial: list[dict]) -> tuple[s
 
 async def _llamar_gemini(mensajes: list[dict]) -> dict:
     """
-    Una sola llamada al endpoint de Gemini compatible con OpenAI.
+    Una sola llamada a la API nativa de Gemini (:generateContent).
+
+    Traduce los mensajes estilo OpenAI al formato nativo: el system prompt va
+    en systemInstruction, el rol "assistant" se llama "model" y cada mensaje
+    es un content con parts de texto. La clave viaja en el header
+    x-goog-api-key (nunca como Bearer: esa ruta es la del endpoint compatible
+    con OpenAI, que rechaza las claves nuevas "AQ." de AI Studio).
 
     Devuelve el JSON ya parseado. Si Google contesta con un error HTTP, lo
     convierte en excepcion con el cuerpo incluido: ahi viene el motivo exacto
     (p. ej. API_KEY_INVALID) y sin eso el fallo es imposible de diagnosticar.
     """
+    sistema = ""
+    contenidos = []
+    for m in mensajes:
+        if m.get("role") == "system":
+            sistema = m.get("content") or ""
+            continue
+        rol = "model" if m.get("role") == "assistant" else "user"
+        contenidos.append({"role": rol, "parts": [{"text": m.get("content") or ""}]})
+
+    cuerpo: dict = {
+        "contents": contenidos,
+        "generationConfig": {"maxOutputTokens": GEMINI_MAX_TOKENS},
+    }
+    if sistema:
+        cuerpo["systemInstruction"] = {"parts": [{"text": sistema}]}
+
     async with httpx.AsyncClient(timeout=GEMINI_TIMEOUT) as http:
         respuesta = await http.post(
-            f"{GEMINI_BASE_URL}/chat/completions",
+            f"{GEMINI_BASE_URL}/models/{MODELO_GEMINI}:generateContent",
             headers={
-                "Authorization": f"Bearer {GEMINI_API_KEY}",
+                "x-goog-api-key": GEMINI_API_KEY,
                 "Content-Type": "application/json",
             },
-            json={
-                "model": MODELO_GEMINI,
-                "messages": mensajes,
-                "max_tokens": GEMINI_MAX_TOKENS,
-            },
+            json=cuerpo,
         )
     if respuesta.status_code != 200:
         raise RuntimeError(
@@ -865,7 +890,7 @@ async def _llamar_gemini(mensajes: list[dict]) -> dict:
     return respuesta.json()
 
 async def _generar_con_gemini(mensaje: str, historial: list[dict]) -> tuple[str, bool]:
-    """Genera la respuesta con Google Gemini (endpoint compatible con OpenAI)."""
+    """Genera la respuesta con Google Gemini (API nativa, :generateContent)."""
     if not GEMINI_API_KEY:
         logger.error("Falta GEMINI_API_KEY: no se puede llamar a Gemini")
         return obtener_mensaje_error(), False
@@ -884,13 +909,18 @@ async def _generar_con_gemini(mensaje: str, historial: list[dict]) -> tuple[str,
         return obtener_mensaje_error(), False
 
     try:
-        eleccion = datos["choices"][0]
-        texto = (eleccion["message"].get("content") or "").strip()
+        candidato = datos["candidates"][0]
+        partes = candidato["content"]["parts"]
+        # Se descartan las partes de razonamiento interno (thought) si el
+        # modelo las incluyera: al cliente solo va el texto de la respuesta.
+        texto = "\n".join(
+            p.get("text", "") for p in partes if not p.get("thought")
+        ).strip()
     except (KeyError, IndexError, TypeError, AttributeError):
         logger.warning(f"Gemini devolvio una respuesta con formato inesperado: {str(datos)[:500]}")
         return obtener_mensaje_fallback(), False
 
-    if eleccion.get("finish_reason") == "length":
+    if candidato.get("finishReason") == "MAX_TOKENS":
         logger.warning(
             f"La respuesta se corto por llegar al tope de {GEMINI_MAX_TOKENS} tokens. "
             "Si pasa seguido, sube GEMINI_MAX_TOKENS o acorta el system prompt."
@@ -900,10 +930,10 @@ async def _generar_con_gemini(mensaje: str, historial: list[dict]) -> tuple[str,
         logger.warning("Gemini devolvio una respuesta sin texto")
         return obtener_mensaje_fallback(), False
 
-    uso = datos.get("usage") or {}
+    uso = datos.get("usageMetadata") or {}
     logger.info(
         f"Respuesta generada con {MODELO_GEMINI} "
-        f"({uso.get('prompt_tokens', '?')} in / {uso.get('completion_tokens', '?')} out)"
+        f"({uso.get('promptTokenCount', '?')} in / {uso.get('candidatesTokenCount', '?')} out)"
     )
     return texto, True
 
